@@ -5185,4 +5185,160 @@ TEST_F(StorageBackendTest, DatasyncFailureRemovesOrphanBucketFile) {
     EXPECT_FALSE(exists.value());
 }
 
+//-----------------------------------------------------------------------------
+// Regression tests for StorageBackend::RemoveFile() redundant per-call sleep.
+//
+// RemoveFile() used to sleep a fixed 50us on every call "to give the write
+// thread time to create the file". Its only live callers, RemoveAll() and
+// RemoveByRegex(), iterate over files that already exist (enumerated from disk
+// or from the eviction tracking queue), so the sleep did nothing but add
+// N * 50us of latency to a bulk wipe. StoreObject(), eviction and RemoveFile()
+// already serialize on the same per-path mutex. These tests pin the delete
+// behaviour and guard against the sleep being reintroduced.
+//-----------------------------------------------------------------------------
+
+namespace {
+// Creates `count` small files under `dir` via ofstream and returns their paths.
+std::vector<std::string> CreatePlainFiles(const std::string& dir,
+                                          const std::string& prefix,
+                                          size_t count) {
+    std::vector<std::string> paths;
+    paths.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        std::string path = dir + "/" + prefix + std::to_string(i);
+        std::ofstream ofs(path);
+        ofs << 'x';
+        paths.push_back(std::move(path));
+    }
+    return paths;
+}
+}  // namespace
+
+TEST_F(StorageBackendTest, RemoveFileDeletesFileEvictionDisabled) {
+    std::string dir = data_path + "/remove_file_disabled";
+    fs::create_directories(dir);
+    StorageBackend backend(dir, "", /*enable_eviction=*/false);
+    ASSERT_TRUE(backend.Init().has_value());
+
+    std::string data(64, 'A');
+    std::string path = dir + "/obj0";
+    ASSERT_TRUE(backend.StoreObject(path, data).has_value());
+    ASSERT_TRUE(fs::exists(path));
+
+    backend.RemoveFile(path);
+    EXPECT_FALSE(fs::exists(path));
+
+    // Removing a path that does not exist must be a safe no-op.
+    backend.RemoveFile(dir + "/does_not_exist");
+}
+
+TEST_F(StorageBackendTest, RemoveFileDeletesTrackedFileEvictionEnabled) {
+    std::string dir = data_path + "/remove_file_enabled";
+    fs::create_directories(dir);
+    StorageBackend backend(dir, "", /*enable_eviction=*/true);
+    ASSERT_TRUE(backend.Init(/*quota_bytes=*/1 << 20).has_value());
+
+    std::string data(64, 'B');
+    std::string path = dir + "/obj0";
+    ASSERT_TRUE(backend.StoreObject(path, data, "key0").has_value());
+    ASSERT_TRUE(fs::exists(path));
+
+    backend.RemoveFile(path);
+    EXPECT_FALSE(fs::exists(path));
+
+    // The tracking queue must have released the path, so a fresh write of the
+    // same size still succeeds against the same quota.
+    ASSERT_TRUE(backend.StoreObject(path, data, "key0-again").has_value());
+    EXPECT_TRUE(fs::exists(path));
+}
+
+TEST_F(StorageBackendTest, RemoveAllDeletesEveryFile) {
+    // Eviction disabled: RemoveAll() scans the root directory.
+    {
+        std::string dir = data_path + "/remove_all_disabled";
+        fs::create_directories(dir);
+        StorageBackend backend(dir, "", /*enable_eviction=*/false);
+        ASSERT_TRUE(backend.Init().has_value());
+        std::string data(64, 'C');
+        std::vector<std::string> paths;
+        for (int i = 0; i < 8; ++i) {
+            std::string path = dir + "/obj" + std::to_string(i);
+            ASSERT_TRUE(backend.StoreObject(path, data).has_value());
+            paths.push_back(path);
+        }
+        backend.RemoveAll();
+        for (const auto& path : paths) EXPECT_FALSE(fs::exists(path));
+    }
+    // Eviction enabled: RemoveAll() drains the tracking queue.
+    {
+        std::string dir = data_path + "/remove_all_enabled";
+        fs::create_directories(dir);
+        StorageBackend backend(dir, "", /*enable_eviction=*/true);
+        ASSERT_TRUE(backend.Init(/*quota_bytes=*/1 << 20).has_value());
+        std::string data(64, 'D');
+        std::vector<std::string> paths;
+        for (int i = 0; i < 8; ++i) {
+            std::string path = dir + "/obj" + std::to_string(i);
+            ASSERT_TRUE(
+                backend.StoreObject(path, data, "k" + std::to_string(i))
+                    .has_value());
+            paths.push_back(path);
+        }
+        backend.RemoveAll();
+        for (const auto& path : paths) EXPECT_FALSE(fs::exists(path));
+    }
+}
+
+// Differential timing guard: RemoveFile() must not add anything close to the
+// old 50us-per-call sleep on top of a bare fs::remove(). Both phases perform
+// the same number of filesystem operations on the same filesystem, so disk
+// speed cancels out; only a reintroduced per-call sleep would blow the budget.
+TEST_F(StorageBackendTest, RemoveFileHasNoPerCallSleepRegression) {
+    constexpr size_t kCount = 2000;
+    // 40us/call * kCount = 80ms budget. The removed sleep was 50us/call
+    // (>= 100ms for kCount), comfortably above the budget; the real fs work is
+    // far below it and is subtracted out via the baseline below.
+    constexpr auto kBudget =
+        std::chrono::microseconds(static_cast<int64_t>(kCount) * 40);
+
+    std::string base_dir = data_path + "/sleep_regression_baseline";
+    std::string subj_dir = data_path + "/sleep_regression_subject";
+    fs::create_directories(base_dir);
+    fs::create_directories(subj_dir);
+
+    // Baseline: mirror RemoveFile()'s eviction-disabled fs work (exists+remove)
+    // without going through the backend.
+    auto base_paths = CreatePlainFiles(base_dir, "b", kCount);
+    auto base_start = std::chrono::steady_clock::now();
+    for (const auto& path : base_paths) {
+        std::error_code ec;
+        if (fs::exists(path)) fs::remove(path, ec);
+    }
+    auto base_elapsed = std::chrono::steady_clock::now() - base_start;
+
+    // Subject: RemoveFile() over the same number of already-existing files.
+    StorageBackend backend(subj_dir, "", /*enable_eviction=*/false);
+    ASSERT_TRUE(backend.Init().has_value());
+    auto subj_paths = CreatePlainFiles(subj_dir, "s", kCount);
+    auto subj_start = std::chrono::steady_clock::now();
+    for (const auto& path : subj_paths) {
+        backend.RemoveFile(path);
+    }
+    auto subj_elapsed = std::chrono::steady_clock::now() - subj_start;
+
+    for (const auto& path : subj_paths) EXPECT_FALSE(fs::exists(path));
+
+    auto overhead = subj_elapsed - base_elapsed;
+    auto overhead_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(overhead).count();
+    LOG(INFO) << "RemoveFile overhead over bare fs::remove for " << kCount
+              << " files: " << overhead_us << " us (budget "
+              << std::chrono::duration_cast<std::chrono::microseconds>(kBudget)
+                     .count()
+              << " us)";
+    EXPECT_LT(overhead, kBudget)
+        << "RemoveFile() appears to add a per-call sleep: overhead "
+        << overhead_us << " us for " << kCount << " files";
+}
+
 }  // namespace mooncake::test
