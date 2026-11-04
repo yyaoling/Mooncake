@@ -3034,6 +3034,58 @@ TEST_F(StorageBackendTest, BucketStorageBackend_BatchLoadSpanReadsWindow) {
     EXPECT_EQ(mismatch.error(), ErrorCode::INVALID_PARAMS);
 }
 
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_BatchLoadReadsWholeValueAndWindows) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_size_limit = 4 * 1024 * 1024;
+    config.total_keys_limit = 1000;
+    OffsetAllocatorStorageBackend storage_backend(config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    const std::string key = "layer_object";
+    std::string value(10000, '\0');
+    for (size_t i = 0; i < value.size(); ++i) {
+        value[i] = static_cast<char>((i * 7) & 0xff);
+    }
+    {
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace(key,
+                      std::vector<Slice>{Slice{value.data(), value.size()}});
+        auto stored = storage_backend.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(stored.has_value());
+    }
+
+    // Whole value: header, key, padding and value come back in one read.
+    auto whole = std::make_unique<char[]>(value.size());
+    std::unordered_map<std::string, Slice> load;
+    load.emplace(key, Slice{whole.get(), value.size()});
+    ASSERT_TRUE(storage_backend.BatchLoad(load));
+    EXPECT_EQ(std::string(static_cast<char*>(load.at(key).ptr), value.size()),
+              value);
+
+    // A prefix window shares the single read; interior and tail windows read
+    // the header and key first, then only the requested bytes.
+    const std::vector<std::pair<uint64_t, size_t>> windows = {
+        {0, 144}, {5000, 144}, {value.size() - 1, 1}};
+    for (const auto& [offset, length] : windows) {
+        auto window = std::make_unique<char[]>(length);
+        std::unordered_map<std::string, StorageValueSpan> spans;
+        spans.emplace(key, StorageValueSpan{offset, value.size(),
+                                            Slice{window.get(), length}});
+        ASSERT_TRUE(storage_backend.BatchLoadSpans(spans))
+            << "offset=" << offset;
+        EXPECT_EQ(
+            std::string(static_cast<char*>(spans.at(key).slice.ptr), length),
+            value.substr(offset, length))
+            << "offset=" << offset;
+    }
+}
+
 //-----------------------------------------------------------------------------
 // DeleteBucket Tests
 //-----------------------------------------------------------------------------
@@ -5689,6 +5741,95 @@ TEST_F(StorageBackendTest, BucketBatchLoadRejectsShortRead) {
     auto load_result = storage_backend.BatchLoad(load_batch);
     ASSERT_FALSE(load_result.has_value());
     EXPECT_EQ(load_result.error(), ErrorCode::FILE_READ_FAIL);
+}
+
+TEST_F(StorageBackendTest, OffsetAllocatorUringAlignsRecordsAndReadsInPlace) {
+    constexpr size_t kAlign = 4096;
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_size_limit = 4 * 1024 * 1024;
+    config.total_keys_limit = 1000;
+    config.use_uring = true;
+    OffsetAllocatorStorageBackend storage_backend(config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+
+    // Odd value and key lengths so no record is naturally a block multiple.
+    const std::vector<std::string> keys = {"k", "a_longer_key_name",
+                                           "layer_object"};
+    const std::vector<size_t> sizes = {1000, 5000, 12345};
+    std::vector<std::string> values;
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::string value(sizes[i], '\0');
+        for (size_t j = 0; j < value.size(); ++j) {
+            value[j] = static_cast<char>((j * 13 + i) & 0xff);
+        }
+        values.push_back(std::move(value));
+    }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        batch.emplace(keys[i],
+                      std::vector<Slice>{Slice{values[i].data(), sizes[i]}});
+    }
+    std::vector<int64_t> offsets;
+    auto stored = storage_backend.BatchOffload(
+        batch, [&](const std::vector<std::string>&,
+                   std::vector<StorageObjectMetadata>& metadatas) {
+            for (const auto& metadata : metadatas) {
+                offsets.push_back(metadata.offset);
+            }
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(stored.has_value()) << stored.error();
+    ASSERT_EQ(offsets.size(), keys.size());
+    for (int64_t offset : offsets) {
+        EXPECT_EQ(offset % static_cast<int64_t>(kAlign), 0)
+            << "record offset " << offset << " is not block aligned";
+    }
+
+    // Destinations follow FileStorage::AllocateBatch: aligned, with room for
+    // align_up(size) plus two blocks.
+    using AlignedBuffer = std::unique_ptr<void, decltype(&std::free)>;
+    auto make_buffer = [&](size_t size) {
+        void* buffer = nullptr;
+        const size_t capacity =
+            (size + kAlign - 1) / kAlign * kAlign + 2 * kAlign;
+        EXPECT_EQ(posix_memalign(&buffer, kAlign, capacity), 0);
+        return AlignedBuffer(buffer, &std::free);
+    };
+
+    std::vector<AlignedBuffer> buffers;
+    std::unordered_map<std::string, Slice> load;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        buffers.push_back(make_buffer(sizes[i]));
+        load.emplace(keys[i], Slice{buffers.back().get(), sizes[i]});
+    }
+    ASSERT_TRUE(storage_backend.BatchLoad(load).has_value());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        EXPECT_EQ(
+            std::string(static_cast<char*>(load.at(keys[i]).ptr), sizes[i]),
+            values[i])
+            << "key=" << keys[i];
+    }
+
+    // A window near the value start fits one request; a window deep in the
+    // value reads the header block and the window separately.
+    const std::string& key = keys[2];
+    const std::string& value = values[2];
+    const std::vector<std::pair<uint64_t, size_t>> windows = {{3000, 1000},
+                                                              {9000, 100}};
+    for (const auto& [offset, length] : windows) {
+        auto window = make_buffer(length);
+        std::unordered_map<std::string, StorageValueSpan> spans;
+        spans.emplace(key, StorageValueSpan{offset, value.size(),
+                                            Slice{window.get(), length}});
+        ASSERT_TRUE(storage_backend.BatchLoadSpans(spans).has_value())
+            << "offset=" << offset;
+        EXPECT_EQ(
+            std::string(static_cast<char*>(spans.at(key).slice.ptr), length),
+            value.substr(offset, length))
+            << "offset=" << offset;
+    }
 }
 
 #endif

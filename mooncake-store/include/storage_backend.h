@@ -1429,6 +1429,15 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         std::unordered_map<std::string, StorageValueSpan>& spans,
         bool require_exact_size);
 
+    // File offset, length and buffer alignment required by O_DIRECT I/O on
+    // the data file.
+    static constexpr uint64_t kDirectIoAlignment = 4096;
+
+    // True when the data file is opened with O_DIRECT (uring). Records are
+    // then allocated in whole kDirectIoAlignment blocks, so every extent the
+    // allocator hands out starts on an aligned file offset.
+    bool UsesDirectIo() const;
+
     // Maximum key length accepted by BatchOffload and trusted on recovery.
     // Write-side enforcement (BatchOffload) and recovery-side validation
     // (RebuildShardMapsFromAllocator) must agree on this bound.
