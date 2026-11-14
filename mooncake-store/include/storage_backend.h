@@ -25,6 +25,7 @@
 #include "file_interface.h"
 #include "mutex.h"
 #include "offset_allocator/offset_allocator.h"
+#include "thirdparty/ankerl/unordered_dense.h"
 #include "types.h"
 
 namespace mooncake {
@@ -833,10 +834,61 @@ struct DiskState {
     // LRU eviction index: {last_access_ns, bucket_id} for buckets on this
     // disk. Maintained lazily; SelectEvictionCandidate() repairs stale entries.
     std::set<std::pair<int64_t, int64_t>> lru_index;
-    // Cached result of ActualDiskBytesUsedLocked() for this disk and when it
-    // was taken. Per-disk because each root is scanned on its own.
-    int64_t cached_disk_bytes = -1;
-    std::chrono::steady_clock::time_point cached_disk_bytes_at;
+};
+
+// State of an entry in BucketStorageBackend::object_bucket_map_.
+//
+// Only kCommitted entries are visible to readers (BatchLoad, BatchQuery,
+// IsExist, ...); the other two are reservations held between
+// PrepareEviction and the commit or restore that resolves it.
+enum class BucketKeyState : uint8_t {
+    // Persisted in metadata.bucket_id and readable.
+    kCommitted,
+    // Reserved by an in-flight BatchOffload that has not committed yet.
+    // metadata.bucket_id is that offload's bucket id, which tells the owner
+    // its reservation apart from one a later offload took after it.
+    kPendingWrite,
+    // Removed from metadata.bucket_id by a PrepareEviction whose master
+    // notification has not been resolved. metadata is kept so a restore is
+    // a state flip rather than a re-insert.
+    kPendingEviction,
+};
+
+struct BucketKeyEntry {
+    StorageObjectMetadata metadata;
+    BucketKeyState state = BucketKeyState::kCommitted;
+};
+
+// Cached physical usage of one disk's offload directory, filled by
+// BucketStorageBackend::ActualDiskBytesUsed(). Deliberately kept out of
+// DiskState: the directory walk behind it can take a long time on a large
+// directory, so it must run without BucketStorageBackend::mutex_, and this
+// cache must therefore be readable and writable without it too.
+//
+// A cached value is valid only while cached_generation equals generation.
+// Invalidate() bumps generation, so a scan that started before files were
+// deleted cannot publish its stale (higher) total afterwards: it stamps the
+// generation it observed at its start, which no longer matches.
+struct DiskUsageCache {
+    // Serialises scans of this disk so concurrent writers do not each walk
+    // the same directory; readers of a fresh value never take it.
+    Mutex scan_mutex;
+    std::atomic<uint64_t> generation{0};
+    std::atomic<uint64_t> cached_generation{UINT64_MAX};
+    std::atomic<int64_t> bytes{0};
+    std::atomic<int64_t> taken_at_ns{0};  // steady_clock, nanoseconds
+
+    void Invalidate() { generation.fetch_add(1, std::memory_order_acq_rel); }
+};
+
+// Physical facts about one disk that PrepareEviction needs, gathered before
+// it takes BucketStorageBackend::mutex_ so no system call runs under it.
+struct DiskSpaceSnapshot {
+    // fs::space() succeeded; available is meaningful only then.
+    bool space_known = false;
+    uint64_t available = 0;
+    // Result of ActualDiskBytesUsed(); 0 when max_physical_bytes is off.
+    int64_t physical_used = 0;
 };
 
 class BucketStorageBackend : public StorageBackendInterface {
@@ -1117,16 +1169,20 @@ class BucketStorageBackend : public StorageBackendInterface {
     // FinalizeEviction removes persisted metadata, waits for in-flight reads,
     // and then deletes the data files.
     struct PendingEviction {
-        std::vector<std::string> keys;  // Keys the eviction removed from the
-                                        // index (matched set; skipped
-                                        // duplicates are never re-pointed)
+        std::vector<std::string> keys;  // Keys the eviction moved to
+                                        // kPendingEviction (matched set;
+                                        // skipped duplicates are never
+                                        // re-pointed)
         std::vector<std::pair<int64_t, std::shared_ptr<BucketMetadata>>>
             buckets;  // (bucket_id, metadata) for file deletion
+        // Keys this call reserved as kPendingWrite. Keys already persisted or
+        // reserved by a concurrent offload are left out (idempotent Put
+        // semantics); the commit phase skips whatever is kCommitted by then.
         std::vector<std::string> write_keys;
-        // Duplicates bypassed instead of failing the batch: already
-        // persisted, or being persisted by a concurrent offload. The
-        // commit phase must skip these (idempotent Put semantics).
-        std::vector<std::string> skipped_keys;
+        // Bucket id stamped on this call's kPendingWrite reservations, so
+        // releasing them never drops a reservation a later offload took on
+        // the same key.
+        int64_t write_bucket_id = -1;
         int64_t evicted_size = 0;
         int64_t write_size = 0;
         // Disk this reservation belongs to. PrepareEviction picks it before
@@ -1154,13 +1210,27 @@ class BucketStorageBackend : public StorageBackendInterface {
      *        @p required_size).
      * @param disk_hint Restrict selection to this disk (>= 0). Used by
      *        watermark eviction, which drives one disk at a time.
+     * @param write_bucket_id Bucket id of the incoming bucket, stamped on the
+     *        kPendingWrite reservations of @p write_keys.
      * @return PendingEviction with all keys and bucket metadata removed;
      *         NO_AVAILABLE_DISK if no disk can hold the incoming bucket;
      *         FILE_WRITE_FAIL if the quota is still exceeded afterwards.
+     *
+     * The free-space and physical-usage probes (system calls, and a
+     * directory walk when the scan cache is stale) run before mutex_ is
+     * taken, so readers are never blocked behind file-system I/O.
      */
     tl::expected<PendingEviction, ErrorCode> PrepareEviction(
         int64_t required_size, const std::vector<std::string>& write_keys = {},
-        int disk_hint = -1);
+        int disk_hint = -1, int64_t write_bucket_id = -1);
+
+    /**
+     * @brief Look up a key readers may see: kCommitted entries only.
+     * Must be called with mutex_ held (shared or exclusive).
+     * @return The entry's metadata, or nullptr if absent or only reserved.
+     */
+    const StorageObjectMetadata* FindCommittedLocked(
+        const std::string& key) const;
 
     /**
      * @brief Pick the disk that should receive an incoming bucket.
@@ -1209,11 +1279,19 @@ class BucketStorageBackend : public StorageBackendInterface {
      * (or its own emptyDir quota), so scanning and capping them together would
      * make one busy disk reject writes on an idle one.
      * Result is cached for bucket_backend_config_.disk_scan_cache_ms to bound
-     * the scan cost regardless of offload rate. Caller must hold mutex_.
+     * the scan cost regardless of offload rate. Must be called WITHOUT
+     * mutex_ held: the walk can take long on a large directory and would
+     * otherwise stall every reader and writer of the backend.
      *
      * @param disk_index The disk whose root is scanned.
      */
-    int64_t ActualDiskBytesUsedLocked(int disk_index) const;
+    int64_t ActualDiskBytesUsed(int disk_index) const;
+
+    /**
+     * @brief Collect the free space and physical usage PrepareEviction needs
+     * for one disk. Runs the system calls, so call it without mutex_ held.
+     */
+    DiskSpaceSnapshot SnapshotDiskSpace(int disk_index) const;
 
     /**
      * @brief Phase 2 of eviction: delete persisted metadata for each evicted
@@ -1270,6 +1348,18 @@ class BucketStorageBackend : public StorageBackendInterface {
     // partial value blocks, unaligned values).
     size_t GetLastAlignedCopyBytesForTest() const {
         return last_aligned_copy_bytes_.load(std::memory_order_relaxed);
+    }
+
+    // Test-only: the cached physical-usage measurement PrepareEviction uses
+    // for one disk, so cache reuse and invalidation are observable.
+    int64_t ActualDiskBytesUsedForTest(int disk_index) const {
+        return ActualDiskBytesUsed(disk_index);
+    }
+
+    // Test-only: buckets the key index can hold without growing.
+    size_t KeyIndexBucketCountForTest() const {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        return object_bucket_map_.bucket_count();
     }
 
     // Test-only: open aligned direct bucket files as on a file system that
@@ -1343,12 +1433,25 @@ class BucketStorageBackend : public StorageBackendInterface {
     // Round-robin cursor for SelectDiskForWrite: the disk to try first on the
     // next write.
     int rr_cursor_ GUARDED_BY(mutex_) = 0;
-    std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
+    // Every key the backend knows about, including the ones a
+    // PrepareEviction has reserved but not yet resolved (see BucketKeyState):
+    // a single lookup answers "persisted?", "being written?" and "being
+    // evicted?", and an eviction only flips a state instead of erasing the
+    // entry and inserting the key into a separate set.
+    //
+    // Open addressing: one contiguous bucket array instead of one heap node
+    // per key, and backward-shift deletion, so the constant insert/erase
+    // churn of offload + eviction never degrades it into periodic rehashes.
+    // erase() moves the last element into the hole, so never keep an
+    // iterator or reference into it across an erase.
+    ankerl::unordered_dense::map<std::string, BucketKeyEntry> GUARDED_BY(mutex_)
         object_bucket_map_;
-    // Reserved key sets stay global: key uniqueness is a property of the whole
-    // backend, not of one disk.
-    std::unordered_set<std::string> GUARDED_BY(mutex_) pending_eviction_keys_;
-    std::unordered_set<std::string> GUARDED_BY(mutex_) pending_write_keys_;
+    // Entries of object_bucket_map_ whose state is not kCommitted, so the
+    // committed key count stays O(1).
+    int64_t GUARDED_BY(mutex_) uncommitted_key_entries_ = 0;
+    // Per-disk physical-usage cache, indexed like disks_ and sized once in
+    // the constructor. Not guarded by mutex_; see DiskUsageCache.
+    std::unique_ptr<DiskUsageCache[]> disk_usage_cache_;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;

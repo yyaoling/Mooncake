@@ -1624,6 +1624,7 @@ BucketStorageBackend::BucketStorageBackend(
         ResolveOffloadDiskPaths(file_storage_config_.storage_filepath);
     const auto& per_disk = bucket_backend_config_.max_total_size_per_disk;
     disks_.resize(disk_paths_.size());
+    disk_usage_cache_ = std::make_unique<DiskUsageCache[]>(disk_paths_.size());
     // Init() rejects a per-disk list of the wrong length; guard the indexing
     // here so construction itself stays safe.
     const bool use_per_disk = per_disk.size() == disks_.size();
@@ -1723,7 +1724,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         }
     }
     const int64_t required_size = file_bytes + bucket->meta_size;
-    auto prepare_result = PrepareEviction(required_size, bucket->keys);
+    auto prepare_result = PrepareEviction(required_size, bucket->keys,
+                                          /*disk_hint=*/-1, bucket_id);
     if (!prepare_result) {
         return tl::make_unexpected(prepare_result.error());
     }
@@ -1774,26 +1776,20 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     {
         SharedMutexLocker lock(&mutex_);
 
-        ReleasePreparedWriteLocked(pending);
-
-        // Duplicate safety net under mutex_: skip keys that PrepareEviction
-        // flagged as already persisted or in flight, plus anything that got
-        // committed since (defense in depth). GroupOffloadingKeysByBucket
-        // filters persisted keys under offloading_mutex_, but a key can
-        // still be committed by a concurrent BatchOffload between that
-        // check and this one. Re-offloading an already persisted key is an
-        // idempotent no-op (same as Put), not an error.
-        const std::unordered_set<std::string> skipped_keys(
-            pending.skipped_keys.begin(), pending.skipped_keys.end());
+        // Duplicate safety net under mutex_: commit every key that is not
+        // kCommitted by now -- this call's own kPendingWrite reservations,
+        // plus keys PrepareEviction skipped whose other copy has since been
+        // released or evicted -- and skip the rest. A key committed by a
+        // concurrent offload since PrepareEviction is skipped the same way.
+        // Re-offloading an already persisted key is an idempotent no-op
+        // (same as Put), not an error. Same rule as the separate pending
+        // sets used to implement: anything not in the committed index.
         std::vector<size_t> committed_indices;
+        committed_indices.reserve(bucket_keys.size());
         for (size_t i = 0; i < bucket_keys.size(); ++i) {
-            if (skipped_keys.find(bucket_keys[i]) != skipped_keys.end() &&
-                object_bucket_map_.find(bucket_keys[i]) !=
-                    object_bucket_map_.end()) {
-                continue;  // Still persisted elsewhere: idempotent skip.
-            }
-            if (object_bucket_map_.find(bucket_keys[i]) ==
-                object_bucket_map_.end()) {
+            auto it = object_bucket_map_.find(bucket_keys[i]);
+            if (it == object_bucket_map_.end() ||
+                it->second.state != BucketKeyState::kCommitted) {
                 committed_indices.push_back(i);
             } else {
                 VLOG(1) << "Key already committed by a concurrent offload, "
@@ -1805,24 +1801,39 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         if (committed_indices.empty()) {
             // Every key was already persisted: nothing new to commit or
             // notify, the written bucket file is redundant.
+            ReleasePreparedWriteLocked(pending);
             lock.unlock();
             CleanupOrphanedBucket(bucket_id, disk_index);
             return bucket_id;
         }
 
         int64_t committed_data_size = bucket->meta_size;
-        object_bucket_map_.reserve(object_bucket_map_.size() +
-                                   committed_indices.size());
         for (size_t i : committed_indices) {
-            auto [it, inserted] =
-                object_bucket_map_.insert({bucket_keys[i], metadatas[i]});
-            CHECK(inserted)
-                << "Reserved key became duplicated: " << bucket_keys[i];
+            // No reserve() here: the map was sized at Init() and grows
+            // geometrically on its own. Re-reserving size()+n on every commit
+            // would resize in small steps, each one a full rehash under the
+            // exclusive lock.
+            auto [it, inserted] = object_bucket_map_.try_emplace(
+                bucket_keys[i],
+                BucketKeyEntry{metadatas[i], BucketKeyState::kCommitted});
+            if (!inserted) {
+                // Taking over a reservation (ours, a concurrent offload's, or
+                // an unresolved eviction's): it stops being uncommitted.
+                CHECK(it->second.state != BucketKeyState::kCommitted)
+                    << "Key became committed under the lock: "
+                    << bucket_keys[i];
+                it->second =
+                    BucketKeyEntry{metadatas[i], BucketKeyState::kCommitted};
+                --uncommitted_key_entries_;
+            }
             committed_data_size +=
                 metadatas[i].data_size + metadatas[i].key_size;
             committed_keys.push_back(bucket_keys[i]);
             committed_metadatas.push_back(metadatas[i]);
         }
+        // After the commit loop, so it only drops this call's reservations
+        // that the loop did not just turn into committed entries.
+        ReleasePreparedWriteLocked(pending);
         auto& disk = disks_[disk_index];
         disk.total_size += committed_data_size;
         auto ts = 0LL;
@@ -1868,9 +1879,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
         batch_object_metadata) {
     SharedMutexLocker lock(&mutex_, shared_lock);
     for (const auto& key : keys) {
-        auto object_metadata_it = object_bucket_map_.find(key);
-        if (object_metadata_it != object_bucket_map_.end()) {
-            batch_object_metadata.emplace(key, object_metadata_it->second);
+        if (const auto* metadata = FindCommittedLocked(key)) {
+            batch_object_metadata.emplace(key, *metadata);
         } else {
             LOG(ERROR) << "Key " << key << " does not exist";
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -1926,12 +1936,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ReadBucketValues(
         for (const auto& [key, span] : spans) {
             const Slice& dest_slice = span.slice;
             // Lookup key -> metadata
-            auto object_it = object_bucket_map_.find(key);
-            if (object_it == object_bucket_map_.end()) {
+            const auto* metadata_ptr = FindCommittedLocked(key);
+            if (metadata_ptr == nullptr) {
                 LOG(ERROR) << "Key not found: " << key;
                 return tl::make_unexpected(ErrorCode::INVALID_KEY);
             }
-            const auto& metadata = object_it->second;
+            const auto& metadata = *metadata_ptr;
 
             // Lookup bucket -> BucketMetadata
             auto bucket_it = buckets_.find(metadata.bucket_id);
@@ -2188,14 +2198,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
 
         SharedMutexLocker lock(&mutex_);
         object_bucket_map_.clear();
+        uncommitted_key_entries_ = 0;
         buckets_.clear();
-        for (auto& disk : disks_) {
+        for (size_t i = 0; i < disks_.size(); ++i) {
+            auto& disk = disks_[i];
             disk.total_size = 0;
             disk.pending_write_size = 0;
             disk.pending_eviction_size = 0;
             disk.fifo_index.clear();
             disk.lru_index.clear();
-            disk.cached_disk_bytes = -1;
+            disk_usage_cache_[i].Invalidate();
         }
         int64_t max_bucket_id = BucketIdGenerator::INIT_NEW_START_ID;
 
@@ -2371,10 +2383,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 disk.lru_index.emplace(0LL, bucket_id);
                 for (size_t i = 0; i < meta.keys.size(); i++) {
                     object_bucket_map_.emplace(
-                        meta.keys[i], StorageObjectMetadata{
-                                          bucket_id, meta.metadatas[i].offset,
-                                          meta.metadatas[i].key_size,
-                                          meta.metadatas[i].data_size, ""});
+                        meta.keys[i],
+                        BucketKeyEntry{StorageObjectMetadata{
+                                           bucket_id, meta.metadatas[i].offset,
+                                           meta.metadatas[i].key_size,
+                                           meta.metadatas[i].data_size, ""},
+                                       BucketKeyState::kCommitted});
                 }
                 buckets_.emplace(bucket_id, std::move(metadata));
             }
@@ -2506,6 +2520,19 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             }
         }
 
+        // Size the key index once, up front: growing it later rehashes every
+        // entry under the exclusive lock, stalling all readers for the
+        // duration. Recovered keys are always covered; the configured
+        // expectation covers the steady state the node grows into.
+        const size_t reserve_keys = std::max<size_t>(
+            object_bucket_map_.size(),
+            static_cast<size_t>(std::max<int64_t>(
+                bucket_backend_config_.metadata_reserve_keys, 0)));
+        object_bucket_map_.reserve(reserve_keys);
+        LOG(INFO) << "[Offload] key index: recovered_keys="
+                  << object_bucket_map_.size()
+                  << " reserved_keys=" << reserve_keys;
+
         // Positional configuration must be checkable in the startup log.
         for (size_t i = 0; i < disks_.size(); ++i) {
             LOG(INFO) << "[Offload] disk " << i << ": path=" << disk_paths_[i]
@@ -2569,19 +2596,19 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
     const std::string& key) {
     SharedMutexLocker lock(&mutex_, shared_lock);
-    auto it = object_bucket_map_.find(key);
-    if (it == object_bucket_map_.end()) {
+    const auto* metadata = FindCommittedLocked(key);
+    if (metadata == nullptr) {
         return false;
     }
     // The index alone cannot see an externally wiped bucket file: writes
     // commit file-then-index, so an index hit with no file behind it means
     // the backing data is gone and the answer must be false, not "present".
-    auto bucket_it = buckets_.find(it->second.bucket_id);
+    auto bucket_it = buckets_.find(metadata->bucket_id);
     if (bucket_it == buckets_.end()) {
         return false;
     }
     auto path =
-        GetBucketDataPath(it->second.bucket_id, bucket_it->second->disk_index);
+        GetBucketDataPath(metadata->bucket_id, bucket_it->second->disk_index);
     if (!path) {
         return tl::make_unexpected(path.error());
     }
@@ -2597,11 +2624,21 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
 std::optional<int64_t> BucketStorageBackend::GetObjectDataSize(
     const std::string& key) const {
     SharedMutexLocker lock(&mutex_, shared_lock);
-    auto it = object_bucket_map_.find(key);
-    if (it == object_bucket_map_.end() || it->second.data_size <= 0) {
+    const auto* metadata = FindCommittedLocked(key);
+    if (metadata == nullptr || metadata->data_size <= 0) {
         return std::nullopt;
     }
-    return it->second.data_size;
+    return metadata->data_size;
+}
+
+const StorageObjectMetadata* BucketStorageBackend::FindCommittedLocked(
+    const std::string& key) const {
+    auto it = object_bucket_map_.find(key);
+    if (it == object_bucket_map_.end() ||
+        it->second.state != BucketKeyState::kCommitted) {
+        return nullptr;
+    }
+    return &it->second.metadata;
 }
 
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
@@ -2688,7 +2725,10 @@ BucketStorageBackend::GetStoreMetadata() {
     for (const auto& disk : disks_) {
         total_size += disk.total_size;
     }
-    OffloadMetadata metadata(object_bucket_map_.size(), total_size);
+    OffloadMetadata metadata(
+        object_bucket_map_.size() -
+            static_cast<std::size_t>(uncommitted_key_entries_),
+        total_size);
     return metadata;
 }
 
@@ -3318,9 +3358,10 @@ void BucketStorageBackend::RollbackCommittedBucket(
         for (const auto& key : keys) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
-                obj_it->second.bucket_id == bucket_id) {
-                disk.total_size -=
-                    obj_it->second.data_size + obj_it->second.key_size;
+                obj_it->second.state == BucketKeyState::kCommitted &&
+                obj_it->second.metadata.bucket_id == bucket_id) {
+                disk.total_size -= obj_it->second.metadata.data_size +
+                                   obj_it->second.metadata.key_size;
                 object_bucket_map_.erase(obj_it);
             }
         }
@@ -3484,17 +3525,54 @@ tl::expected<int, ErrorCode> BucketStorageBackend::SelectDiskForWrite(
     return tl::make_unexpected(ErrorCode::NO_AVAILABLE_DISK);
 }
 
-int64_t BucketStorageBackend::ActualDiskBytesUsedLocked(int disk_index) const {
+int64_t BucketStorageBackend::ActualDiskBytesUsed(int disk_index) const {
     namespace fs = std::filesystem;
-    auto& disk = disks_[disk_index];
+    auto& cache = disk_usage_cache_[disk_index];
     const std::string& disk_path = disk_paths_[disk_index];
-    auto now = std::chrono::steady_clock::now();
-    if (disk.cached_disk_bytes >= 0 &&
-        now - disk.cached_disk_bytes_at <
-            std::chrono::milliseconds(
-                bucket_backend_config_.disk_scan_cache_ms)) {
-        return disk.cached_disk_bytes;
+    constexpr int64_t kNsPerMs = 1000000;
+    const int64_t ttl_ns =
+        bucket_backend_config_.disk_scan_cache_ms >
+                std::numeric_limits<int64_t>::max() / kNsPerMs
+            ? std::numeric_limits<int64_t>::max()
+            : bucket_backend_config_.disk_scan_cache_ms * kNsPerMs;
+    const auto steady_now_ns = [] {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    };
+    // A cached value counts only if no Invalidate() happened since the scan
+    // that produced it began, and it is younger than the TTL.
+    const auto try_cached = [&](int64_t now_ns, int64_t* out) {
+        const uint64_t generation =
+            cache.generation.load(std::memory_order_acquire);
+        if (cache.cached_generation.load(std::memory_order_acquire) !=
+            generation) {
+            return false;
+        }
+        const int64_t taken_at =
+            cache.taken_at_ns.load(std::memory_order_relaxed);
+        if (now_ns - taken_at >= ttl_ns) {
+            return false;
+        }
+        *out = cache.bytes.load(std::memory_order_relaxed);
+        return true;
+    };
+
+    int64_t cached = 0;
+    if (try_cached(steady_now_ns(), &cached)) {
+        return cached;
     }
+    // One scan per disk at a time. A writer that waited here re-checks:
+    // the scan it waited on has most likely just refreshed the value.
+    MutexLocker scan_locker(&cache.scan_mutex);
+    const int64_t now_ns = steady_now_ns();
+    if (try_cached(now_ns, &cached)) {
+        return cached;
+    }
+    // Stamp the generation before walking, so files deleted (and the cache
+    // invalidated) while the walk runs make this result stale on arrival.
+    const uint64_t scan_generation =
+        cache.generation.load(std::memory_order_acquire);
     int64_t total = 0;
     std::error_code ec;
     // Physical usage includes the whole subtree (du/kubelet accounting), even
@@ -3529,16 +3607,65 @@ int64_t BucketStorageBackend::ActualDiskBytesUsedLocked(int disk_index) const {
             total += static_cast<int64_t>(st.st_blocks) * 512;
         }
     }
-    disk.cached_disk_bytes = total;
-    disk.cached_disk_bytes_at = now;
+    cache.bytes.store(total, std::memory_order_relaxed);
+    cache.taken_at_ns.store(now_ns, std::memory_order_relaxed);
+    // Release: publishes bytes/taken_at_ns to readers that acquire this.
+    cache.cached_generation.store(scan_generation, std::memory_order_release);
     return total;
+}
+
+DiskSpaceSnapshot BucketStorageBackend::SnapshotDiskSpace(
+    int disk_index) const {
+    namespace fs = std::filesystem;
+    DiskSpaceSnapshot snapshot;
+    std::error_code ec;
+    auto space_info = fs::space(disk_paths_[disk_index], ec);
+    if (!ec) {
+        snapshot.space_known = true;
+        snapshot.available = space_info.available;
+    } else {
+        LOG(WARNING) << "[Evict] Failed to get disk space info for "
+                     << disk_paths_[disk_index] << ": " << ec.message();
+    }
+    if (bucket_backend_config_.max_physical_bytes > 0) {
+        snapshot.physical_used = ActualDiskBytesUsed(disk_index);
+    }
+    return snapshot;
 }
 
 tl::expected<BucketStorageBackend::PendingEviction, ErrorCode>
 BucketStorageBackend::PrepareEviction(
     int64_t required_size, const std::vector<std::string>& write_keys,
-    int disk_hint) {
+    int disk_hint, int64_t write_bucket_id) {
+    const int disk_count = static_cast<int>(disk_paths_.size());
+    if (disk_hint >= disk_count) {
+        LOG(ERROR) << "PrepareEviction called with out-of-range disk hint "
+                   << disk_hint;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    const bool eviction_enabled =
+        bucket_backend_config_.eviction_policy != BucketEvictionPolicy::NONE;
+
+    // Probe free space and physical usage BEFORE taking mutex_. fs::space()
+    // is a system call and the physical-usage check may walk the whole
+    // offload directory; under the exclusive lock either one stalls every
+    // reader and writer of the backend for its whole duration. The disk is
+    // picked under the lock below, so without a hint every disk is probed:
+    // a statfs each, plus a scan-cache hit in the common case. Reading the
+    // values a moment before the lock adds no staleness the scan cache does
+    // not already accept.
+    std::vector<DiskSpaceSnapshot> snapshots;
+    if (eviction_enabled) {
+        snapshots.resize(disk_count);
+        for (int i = 0; i < disk_count; ++i) {
+            if (disk_hint < 0 || i == disk_hint) {
+                snapshots[i] = SnapshotDiskSpace(i);
+            }
+        }
+    }
+
     PendingEviction result;
+    result.write_bucket_id = write_bucket_id;
     SharedMutexLocker lock(&mutex_);
 
     // Pick the disk first: the quota, the drain target and the free-space
@@ -3547,11 +3674,6 @@ BucketStorageBackend::PrepareEviction(
     // cannot pick the same disk based on free space this call is about to
     // consume.
     int disk_index = disk_hint;
-    if (disk_index >= static_cast<int>(disks_.size())) {
-        LOG(ERROR) << "PrepareEviction called with out-of-range disk hint "
-                   << disk_hint;
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
     if (disk_index < 0) {
         auto disk_result = SelectDiskForWrite(required_size);
         if (!disk_result) {
@@ -3565,34 +3687,45 @@ BucketStorageBackend::PrepareEviction(
     auto& disk = disks_[disk_index];
 
     if (!write_keys.empty()) {
+        // One lookup per key: try_emplace reserves an absent key in place,
+        // and a present key's state says why it is present.
+        result.write_keys.reserve(write_keys.size());
         for (const auto& key : write_keys) {
-            if (object_bucket_map_.find(key) != object_bucket_map_.end() ||
-                pending_write_keys_.find(key) != pending_write_keys_.end()) {
-                // Already persisted, or being persisted by a concurrent
-                // offload: re-offloading is an idempotent no-op (Put
-                // semantics), skip it instead of failing the whole batch.
-                result.skipped_keys.push_back(key);
+            auto [it, inserted] = object_bucket_map_.try_emplace(
+                key, BucketKeyEntry{
+                         StorageObjectMetadata{write_bucket_id, 0, 0, 0, ""},
+                         BucketKeyState::kPendingWrite});
+            if (inserted) {
+                ++uncommitted_key_entries_;
+                result.write_keys.push_back(key);
                 continue;
             }
-            if (pending_eviction_keys_.find(key) !=
-                pending_eviction_keys_.end()) {
+            if (it->second.state == BucketKeyState::kPendingEviction) {
                 // About to be evicted: the old copy is on its way out, so a
-                // skip could lose the only replica. Fail loudly here.
+                // skip could lose the only replica. Fail loudly here, after
+                // undoing the reservations this call already took.
+                for (const auto& reserved : result.write_keys) {
+                    object_bucket_map_.erase(reserved);
+                }
+                uncommitted_key_entries_ -=
+                    static_cast<int64_t>(result.write_keys.size());
                 return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
-            result.write_keys.push_back(key);
+            // kCommitted (already persisted) or kPendingWrite (being
+            // persisted by a concurrent offload): re-offloading is an
+            // idempotent no-op (Put semantics), skip it instead of failing
+            // the whole batch.
         }
         if (!result.write_keys.empty()) {
             result.write_size = required_size;
             disk.pending_write_size += required_size;
-            pending_write_keys_.insert(result.write_keys.begin(),
-                                       result.write_keys.end());
         }
     }
 
-    if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
+    if (!eviction_enabled) {
         return result;
     }
+    const DiskSpaceSnapshot& space = snapshots[disk_index];
 
     // Check actual disk space once before the loop. PrepareEviction only
     // removes metadata -- files are deleted later in FinalizeEviction -- so
@@ -3605,30 +3738,22 @@ BucketStorageBackend::PrepareEviction(
     // meta_size, so this is a safe lower bound -- we will not under-evict.
     bool initial_disk_full = false;
     uint64_t deficit = 0;
-    {
-        namespace fs = std::filesystem;
-        std::error_code ec;
-        auto space_info = fs::space(disk_paths_[disk_index], ec);
-        if (!ec) {
-            uint64_t actual_available = space_info.available;
-            constexpr uint64_t kMinFreeSpace = 256 * kMB;
-            // Watermark eviction passes a synthetic required_size to drive
-            // quota-based cleanup. It is not a real incoming write, so it
-            // should not be counted as physical disk free-space demand.
-            uint64_t req_sz = (!result.write_keys.empty() && required_size > 0)
-                                  ? static_cast<uint64_t>(required_size)
-                                  : 0;
-            initial_disk_full = actual_available < req_sz + kMinFreeSpace;
-            if (initial_disk_full) {
-                deficit = req_sz + kMinFreeSpace - actual_available;
-                LOG(WARNING) << "[Evict] Actual disk space too low: available="
-                             << actual_available << ", required=" << req_sz
-                             << ", deficit=" << deficit
-                             << ". Will evict buckets to free space.";
-            }
-        } else {
-            LOG(WARNING) << "[Evict] Failed to get disk space info for "
-                         << disk_paths_[disk_index] << ": " << ec.message();
+    if (space.space_known) {
+        uint64_t actual_available = space.available;
+        constexpr uint64_t kMinFreeSpace = 256 * kMB;
+        // Watermark eviction passes a synthetic required_size to drive
+        // quota-based cleanup. It is not a real incoming write, so it
+        // should not be counted as physical disk free-space demand.
+        uint64_t req_sz = (!result.write_keys.empty() && required_size > 0)
+                              ? static_cast<uint64_t>(required_size)
+                              : 0;
+        initial_disk_full = actual_available < req_sz + kMinFreeSpace;
+        if (initial_disk_full) {
+            deficit = req_sz + kMinFreeSpace - actual_available;
+            LOG(WARNING) << "[Evict] Actual disk space too low: available="
+                         << actual_available << ", required=" << req_sz
+                         << ", deficit=" << deficit
+                         << ". Will evict buckets to free space.";
         }
     }
 
@@ -3645,14 +3770,12 @@ BucketStorageBackend::PrepareEviction(
         write_keys.empty() ? 0 : required_size;
 
     // Ground-truth physical usage of the offload directory (cached),
-    // snapshotted once. As buckets are selected for eviction their files get
-    // deleted in the later FinalizeEviction, so (physical_used_start -
-    // accumulated_freed_space) projects the physical bytes that will remain
-    // after this round.
+    // snapshotted once, before mutex_ was taken. As buckets are selected for
+    // eviction their files get deleted in the later FinalizeEviction, so
+    // (physical_used_start - accumulated_freed_space) projects the physical
+    // bytes that will remain after this round.
     const int64_t physical_used_start =
-        bucket_backend_config_.max_physical_bytes > 0
-            ? ActualDiskBytesUsedLocked(disk_index)
-            : 0;
+        bucket_backend_config_.max_physical_bytes > 0 ? space.physical_used : 0;
     // True when the projected physical usage after this round — real disk usage
     // minus what we free here, plus the incoming write — would still exceed the
     // physical cap. Shared by the in-loop "keep evicting" test and the
@@ -3711,13 +3834,16 @@ BucketStorageBackend::PrepareEviction(
         for (const auto& key : evict_meta->keys) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
-                obj_it->second.bucket_id == evict_id) {
-                const int64_t object_size =
-                    obj_it->second.data_size + obj_it->second.key_size;
+                obj_it->second.state == BucketKeyState::kCommitted &&
+                obj_it->second.metadata.bucket_id == evict_id) {
+                const int64_t object_size = obj_it->second.metadata.data_size +
+                                            obj_it->second.metadata.key_size;
                 disk.total_size -= object_size;
                 evicted_size += object_size;
-                object_bucket_map_.erase(obj_it);
-                pending_eviction_keys_.insert(key);
+                // Hidden from readers from here on. A restore flips it back,
+                // a commit erases it; no separate pending set to maintain.
+                obj_it->second.state = BucketKeyState::kPendingEviction;
+                ++uncommitted_key_entries_;
                 result.keys.push_back(key);
             }
         }
@@ -3770,28 +3896,28 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
     auto& disk = disks_[pending.disk_index];
     CHECK_GE(disk.pending_eviction_size, pending.evicted_size);
     disk.pending_eviction_size -= pending.evicted_size;
-    for (const auto& key : pending.keys) {
-        pending_eviction_keys_.erase(key);
-    }
-    const std::unordered_set<std::string> restore_keys(pending.keys.begin(),
-                                                       pending.keys.end());
     for (auto& [bucket_id, bucket_meta] : pending.buckets) {
         if (!bucket_meta || buckets_.find(bucket_id) != buckets_.end()) {
             continue;
         }
 
-        for (size_t i = 0; i < bucket_meta->keys.size(); ++i) {
-            const auto& key = bucket_meta->keys[i];
-            if (restore_keys.find(key) == restore_keys.end()) {
-                // matched-only mirror of the prepare phase: skipped duplicates
-                // stay pointed at their authoritative bucket, never re-pointed
+        // The entries prepare moved to kPendingEviction still carry this
+        // bucket's metadata, so restoring is a state flip. The state check
+        // is the matched-only mirror of the prepare phase: skipped
+        // duplicates stay pointed at their authoritative bucket, and a key
+        // a concurrent offload committed over the reservation keeps that
+        // newer copy.
+        for (const auto& key : bucket_meta->keys) {
+            auto it = object_bucket_map_.find(key);
+            if (it == object_bucket_map_.end() ||
+                it->second.state != BucketKeyState::kPendingEviction ||
+                it->second.metadata.bucket_id != bucket_id) {
                 continue;
             }
-            const auto& object_meta = bucket_meta->metadatas[i];
-            object_bucket_map_[key] = StorageObjectMetadata{
-                bucket_id, object_meta.offset, object_meta.key_size,
-                object_meta.data_size, ""};
-            disk.total_size += object_meta.data_size + object_meta.key_size;
+            it->second.state = BucketKeyState::kCommitted;
+            --uncommitted_key_entries_;
+            disk.total_size +=
+                it->second.metadata.data_size + it->second.metadata.key_size;
         }
         disk.total_size += bucket_meta->meta_size;
         // Both indexes must be restored. Forgetting fifo_index would leave the
@@ -3815,8 +3941,22 @@ void BucketStorageBackend::CommitPreparedEviction(
     auto& disk = disks_[pending.disk_index];
     CHECK_GE(disk.pending_eviction_size, pending.evicted_size);
     disk.pending_eviction_size -= pending.evicted_size;
+    std::unordered_set<int64_t> evicted_bucket_ids;
+    evicted_bucket_ids.reserve(pending.buckets.size());
+    for (const auto& [bucket_id, bucket_meta] : pending.buckets) {
+        evicted_bucket_ids.insert(bucket_id);
+    }
+    // The master accepted the removal: drop the reserved entries for good.
+    // Leave any entry no longer in kPendingEviction for one of these
+    // buckets -- a concurrent offload has committed a new copy over it.
     for (const auto& key : pending.keys) {
-        pending_eviction_keys_.erase(key);
+        auto it = object_bucket_map_.find(key);
+        if (it != object_bucket_map_.end() &&
+            it->second.state == BucketKeyState::kPendingEviction &&
+            evicted_bucket_ids.count(it->second.metadata.bucket_id) != 0) {
+            object_bucket_map_.erase(it);
+            --uncommitted_key_entries_;
+        }
     }
 }
 
@@ -3838,8 +3978,17 @@ void BucketStorageBackend::ReleasePreparedWriteLocked(
     auto& disk = disks_[pending.disk_index];
     CHECK_GE(disk.pending_write_size, pending.write_size);
     disk.pending_write_size -= pending.write_size;
+    // Drop only this call's own reservations still unresolved. One the
+    // commit turned into a kCommitted entry, or a concurrent offload took
+    // over, is no longer ours to remove.
     for (const auto& key : pending.write_keys) {
-        pending_write_keys_.erase(key);
+        auto it = object_bucket_map_.find(key);
+        if (it != object_bucket_map_.end() &&
+            it->second.state == BucketKeyState::kPendingWrite &&
+            it->second.metadata.bucket_id == pending.write_bucket_id) {
+            object_bucket_map_.erase(it);
+            --uncommitted_key_entries_;
+        }
     }
 }
 
@@ -3934,11 +4083,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
                   << " cleanup_failed=" << cleanup_failed_count;
         // Files were just deleted; force the next physical-usage query to
         // rescan rather than return the now-stale (higher) cached value.
-        {
-            SharedMutexLocker lock(&mutex_);
-            for (const auto& [bucket_id, bucket_meta] : pending.buckets) {
-                disks_[bucket_meta->disk_index].cached_disk_bytes = -1;
-            }
+        // The cache lives outside mutex_, so this no longer takes it.
+        for (const auto& [bucket_id, bucket_meta] : pending.buckets) {
+            disk_usage_cache_[bucket_meta->disk_index].Invalidate();
         }
     }
     if (cleanup_failed_count != 0) {
@@ -4052,9 +4199,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
         for (const auto& key : keys_to_remove) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
-                obj_it->second.bucket_id == bucket_id) {
-                disk.total_size -=
-                    obj_it->second.data_size + obj_it->second.key_size;
+                obj_it->second.state == BucketKeyState::kCommitted &&
+                obj_it->second.metadata.bucket_id == bucket_id) {
+                disk.total_size -= obj_it->second.metadata.data_size +
+                                   obj_it->second.metadata.key_size;
                 object_bucket_map_.erase(obj_it);
             }
         }
