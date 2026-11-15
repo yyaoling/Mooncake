@@ -819,13 +819,23 @@ std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
         }
         case BackendType::BUCKET: {
             config.storage_backend_type = mooncake::StorageBackendType::kBucket;
-            mooncake::BucketBackendConfig bucket_config;
-            bucket_config.bucket_size_limit = 256 * MB;
-            bucket_config.bucket_keys_limit = 500;
-            bucket_config.aligned_direct_write =
+            // Start from the environment so eviction can be exercised at all.
+            // The previous hardcoded values (256 MB bucket, 500 keys) are
+            // exactly what a default-constructed BucketBackendConfig already
+            // holds, but eviction_policy / max_total_size / max_physical_bytes
+            // / disk_scan_cache_ms were never read here, so the bucket backend
+            // in this benchmark could never evict -- and the physical-usage
+            // directory walk that eviction performs never ran.
+            auto bucket_config =
+                mooncake::BucketBackendConfig::FromEnvironment();
+            if (!bucket_config) {
+                LOG(ERROR) << "Invalid bucket backend environment";
+                return nullptr;
+            }
+            bucket_config->aligned_direct_write =
                 FLAGS_bucket_aligned_direct_write;
             return std::make_shared<mooncake::BucketStorageBackend>(
-                config, bucket_config);
+                config, bucket_config.value());
         }
         case BackendType::FILE_PER_KEY: {
             config.storage_backend_type =
