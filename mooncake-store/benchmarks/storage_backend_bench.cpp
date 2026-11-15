@@ -76,6 +76,7 @@
 #include <iomanip>
 #include <iostream>
 #include <latch>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -854,16 +855,35 @@ std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
 // Utility Functions
 // ============================================================================
 
-void CleanupStoragePath(const std::string& path) {
-    if (fs::exists(path)) {
-        std::error_code ec;
-        fs::remove_all(path, ec);
-        if (ec) {
-            LOG(WARNING) << "Failed to cleanup " << path << ": "
-                         << ec.message();
-        }
+// Split the comma-separated root list the bucket backend accepts into
+// individual paths. Treating the whole string as one path silently cleans only
+// a directory literally named "a,b,c", leaving the real roots untouched.
+std::vector<std::string> SplitStoragePaths(const std::string& paths) {
+    std::vector<std::string> out;
+    size_t begin = 0;
+    while (begin <= paths.size()) {
+        const size_t comma = paths.find(',', begin);
+        const size_t end = comma == std::string::npos ? paths.size() : comma;
+        if (end > begin) out.push_back(paths.substr(begin, end - begin));
+        if (comma == std::string::npos) break;
+        begin = comma + 1;
     }
-    fs::create_directories(path);
+    if (out.empty()) out.push_back(paths);
+    return out;
+}
+
+void CleanupStoragePath(const std::string& path) {
+    for (const auto& root : SplitStoragePaths(path)) {
+        if (fs::exists(root)) {
+            std::error_code ec;
+            fs::remove_all(root, ec);
+            if (ec) {
+                LOG(WARNING) << "Failed to cleanup " << root << ": "
+                             << ec.message();
+            }
+        }
+        fs::create_directories(root);
+    }
 }
 
 // Print system info (best effort)
@@ -1820,6 +1840,17 @@ void BenchMixedRW(BackendType type, const std::string& storage_path,
     write_stats.InitThreads(write_threads, num_operations);
 
     std::atomic<size_t> next_write_key{initial_keys};
+    // Readers keep going until every writer is done. Bounding them by
+    // num_operations too made them exit almost immediately: one write costs
+    // orders of magnitude more than one read, so with the same op count the
+    // readers finished in a fraction of a second while the writers ran for
+    // many minutes -- the collected read latencies covered only the very start
+    // of the run and never sampled a steady-state eviction.
+    std::atomic<bool> readers_stop{false};
+    std::atomic<size_t> writers_remaining{write_threads};
+    // Cap per-reader samples so a long run cannot grow the latency vector
+    // without bound; 2M samples is far more than the tail needs.
+    constexpr size_t kMaxReaderSamples = 2'000'000;
     std::latch start_latch(total_threads + 1);
     std::latch end_latch(total_threads);
     std::vector<std::thread> threads;
@@ -1827,28 +1858,66 @@ void BenchMixedRW(BackendType type, const std::string& storage_path,
     // Create reader threads
     for (size_t t = 0; t < read_threads; ++t) {
         threads.emplace_back([&, t]() {
-            DataGenerator local_gen(42 + t);
             BufferPool local_buffers;
             local_buffers.Init(batch_size, value_size);
             BatchContainers batch;
             batch.Reserve(batch_size);
 
             ThreadStats& my_stats = read_stats.GetThreadStats(t);
-            my_stats.Reserve(num_operations);
+            // Reserved up front for the full sample cap: readers now outlive
+            // their op budget, and a mid-run vector reallocation would copy
+            // millions of samples inside the timed region and show up as tail
+            // latency that has nothing to do with the backend.
+            my_stats.Reserve(kMaxReaderSamples);
 
-            KeyIndexGenerator key_gen(initial_keys,
+            // Sample the most recently written keys. Eviction reclaims the
+            // oldest buckets first, so the tail of the written range is what is
+            // still resident; a reader pinned to the pre-populated prefix would
+            // miss almost every time once the run reaches steady state, and
+            // would then measure the failure path instead of the read path.
+            // Constructed once: rebuilding a ZIPF generator per operation would
+            // recompute its table and swamp the latency being measured.
+            KeyIndexGenerator key_gen(std::max<size_t>(initial_keys, 1),
                                       StringToAccessPattern(FLAGS_pattern),
                                       FLAGS_zipf_skew, 42 + t);
 
             start_latch.arrive_and_wait();
 
-            for (size_t op = 0; op < num_operations; ++op) {
+            // With writers present, run until they are done; otherwise honour
+            // num_operations as before.
+            const size_t read_ops =
+                write_threads == 0 ? num_operations
+                                   : std::numeric_limits<size_t>::max();
+            for (size_t op = 0; op < read_ops; ++op) {
+                if (readers_stop.load(std::memory_order_relaxed)) break;
+                if (my_stats.latencies.size() >= kMaxReaderSamples) break;
+                const size_t max_keys = keys.Size();
+                if (max_keys == 0) {
+                    std::this_thread::yield();
+                    continue;
+                }
+                // Writer keys wrap at max_keys, so clamp before deriving the
+                // window; that keeps window_lo + (r % window) in range without
+                // a second modulo that would scatter the access pattern.
+                const size_t written =
+                    std::min(next_write_key.load(std::memory_order_relaxed),
+                             max_keys);
+                if (written == 0) {
+                    std::this_thread::yield();
+                    continue;
+                }
+                const size_t window =
+                    std::min(written, std::max<size_t>(initial_keys, 1));
+                const size_t window_lo = written - window;
                 // Build load request
                 batch.ClearLoad();
                 for (size_t i = 0; i < batch_size; ++i) {
-                    batch.key_indices[i] = key_gen.Next();
+                    // Keep the configured access pattern's shape, but slide it
+                    // into the window that is still resident.
+                    const size_t idx = window_lo + (key_gen.Next() % window);
+                    batch.key_indices[i] = idx;
                     batch.load_batch.emplace(
-                        keys.Get(batch.key_indices[i]),
+                        keys.Get(idx),
                         mooncake::Slice{local_buffers.Get(i), value_size});
                 }
 
@@ -1929,6 +1998,11 @@ void BenchMixedRW(BackendType type, const std::string& storage_path,
                 }
             }
 
+            // Last writer out releases the readers, which otherwise run until
+            // their sample cap.
+            if (writers_remaining.fetch_sub(1) == 1) {
+                readers_stop.store(true, std::memory_order_relaxed);
+            }
             end_latch.count_down();
         });
     }
